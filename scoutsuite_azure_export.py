@@ -19,8 +19,6 @@ except ImportError:
 
 JS_HEADER = re.compile(rb"^(?:(?:var|let|const)\s+)?scoutsuite_results\s*=\s*")
 SUBSCRIPTION = re.compile(r"(?:\.subscriptions\.|/subscriptions/)([^./]+)", re.I)
-ARM_SUBSCRIPTION_PREFIX = re.compile(r"/subscriptions/[^/]+(?=/|$)", re.I)
-SCOUT_SUBSCRIPTION_PREFIX = re.compile(r"^([^.]+)\.subscriptions\.[^.]+(?=\.|$)", re.I)
 
 
 def result_files(inputs):
@@ -180,7 +178,7 @@ def index_findings(db, path):
 
 
 ASSET_FIELDS = {
-    "resource_id", "id", "name", "display_name", "displayName", "resource_group_name"
+    "resource_id", "id", "name", "display_name", "displayName"
 }
 
 
@@ -213,7 +211,7 @@ def index_resources(db, path):
 
 def matching_nodes(db, parts, template, key=(), kind="start_map", fields=None):
     """Return indexed ancestors up to the rule target, excluding UI suffixes."""
-    node = fields, parts
+    node = fields, key
     if not template:
         return [node]
     if not parts:
@@ -244,15 +242,23 @@ def matching_nodes(db, parts, template, key=(), kind="start_map", fields=None):
 
 def label(node):
     if isinstance(node, dict):
-        for key in ("resource_id", "id", "name", "display_name", "displayName"):
+        for key in ("name", "display_name", "displayName", "resource_id", "id"):
             value = node.get(key)
-            if isinstance(value, str) and value.startswith("/"):
-                return value
-        for key in ("name", "display_name", "displayName", "id"):
-            value = node.get(key)
-            if isinstance(value, str) and value.strip():
-                return value
+            if not isinstance(value, str) or not value.strip():
+                continue
+            if value.startswith("/"):
+                parts = value.strip("/").split("/")
+                if len(parts) > 2 and "providers" in (part.lower() for part in parts):
+                    return parts[-1]
+            elif key in ("name", "display_name", "displayName"):
+                return value.strip()
     return ""
+
+
+CONFIGURATION_CHILDREN = {
+    "blob_services", "firewall_rules", "postgresql_firewall_rules",
+    "security_rules", "default_security_rules",
+}
 
 
 def asset_for(db, service, template, path):
@@ -265,31 +271,19 @@ def asset_for(db, service, template, path):
         subscription = "Tenant-wide" if service == "aad" else "Unknown"
 
     if nodes is None:
-        return subscription, path, path
+        return subscription, "Name unavailable", path
 
-    # Include ancestor names for child resources whose names are only locally unique.
-    names = []
-    resource_group = ""
-    for node, _ in nodes:
-        name = label(node)
-        if name and name != subscription and (not names or name != names[-1]):
-            names.append(name)
-        if isinstance(node, dict) and isinstance(node.get("resource_group_name"), str):
-            resource_group = node["resource_group_name"]
+    # These child objects describe settings on their owning Azure resource.
+    for index, field in enumerate(rule_path):
+        if field in CONFIGURATION_CHILDREN:
+            nodes = nodes[:index + 1]
+            break
 
-    resource, suffix = nodes[-1]
-    target = path
-    if suffix:
-        target = ".".join(path.split(".")[:-len(suffix)])
-    if not label(resource) and len(nodes) > 1:
-        # Keep the exact child key when ScoutSuite supplies no resource name.
-        child_parts = nodes[-2][1]
-        key_size = len(child_parts) - len(suffix)
-        names.append(".".join(child_parts[:key_size]))
-    asset = " / ".join(names) if names else target
-    if resource_group and not any(name.startswith("/") for name in names):
-        asset = f"{asset} (Resource group: {resource_group})"
-    return subscription, asset, target
+    fields, key = nodes[-1]
+    name = label(fields)
+    if not name and key and isinstance(key[-1], str):
+        name = label({"id": key[-1]})
+    return subscription, name or "Name unavailable", json.dumps(key)
 
 
 def process_report(db, path):
@@ -302,9 +296,6 @@ def process_report(db, path):
         FROM items i JOIN rules r USING (service, rule)
     """):
         subscription, asset, target = asset_for(db, service, template or "", item)
-        # Keep subscription scope for deduplication, and remove it from display paths.
-        asset = SCOUT_SUBSCRIPTION_PREFIX.sub(r"\1", asset)
-        asset = ARM_SUBSCRIPTION_PREFIX.sub("", asset).strip() or "Configuration"
         db.execute("INSERT OR REPLACE INTO output VALUES (?, ?, ?, ?, ?, ?, ?)", (
             tenant, service, rule, subscription, target, description or rule,
             asset,
